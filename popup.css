@@ -1,0 +1,33 @@
+:root {
+  color-scheme: light dark;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+body {
+  min-width: 340px;
+}
+
+table {
+  width: 100%;
+}
+
+td {
+  vertical-align: middle;
+}
+
+td:first-child {
+  overflow-wrap: anywhere;
+}
+
+td:last-child {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+button {
+  white-space: nowrap;
+}
