@@ -10,12 +10,12 @@ body {
   min-width: 340px;
 }
 
-table {
-  width: 100%;
+strong {
+  overflow-wrap: anywhere;
 }
 
-td {
-  vertical-align: middle;
+table {
+  width: 100%;
 }
 
 td:first-child {

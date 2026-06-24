@@ -6,42 +6,81 @@ const listEl = document.getElementById("list");
 const emptyEl = document.getElementById("empty");
 
 let activeTab = null;
+let currentHost = null;
 let currentOrigin = null;
-let currentHostname = null;
 
-const toOrigin = (hostname) => `*://${hostname}/*`;
+const toOrigin = (hostname) => `*://${hostname.toLowerCase()}/*`;
 
-const toHostname = (origin) => {
-  const match = /^\*:\/\/([^/]+)\/\*$/.exec(origin);
-  return match ? match[1] : null;
+const parseOrigin = (origin) => {
+  const match = /^\*:\/\/(\*\.)?([^/*]+)\/\*$/.exec(origin);
+  if (!match) return null;
+  return {
+    origin,
+    host: match[2].toLowerCase(),
+    wildcard: Boolean(match[1])
+  };
 };
 
 const toLabel = (origin) => {
-  const hostname = toHostname(origin);
-  if (!hostname) return origin;
-  const label = hostname.startsWith("*.") ? hostname.slice(2) : hostname;
-  return label.startsWith("www.") ? label.slice(4) : label;
+  const site = parseOrigin(origin);
+  return site ? site.host : origin;
 };
 
-const matchesHostname = (origin, hostname) => {
-  const pattern = toHostname(origin);
-  if (!pattern) return false;
-  if (pattern === hostname) return true;
-  if (!pattern.startsWith("*.")) return false;
-  const base = pattern.slice(2);
-  return hostname === base || hostname.endsWith(`.${base}`);
+const coversHost = (site, host) => {
+  if (!site) return false;
+  const value = host.toLowerCase();
+  if (!site.wildcard) return value === site.host;
+  return value === site.host || value.endsWith(`.${site.host}`);
 };
 
-const sortSites = (sites) => [...sites].sort((a, b) => toLabel(a).localeCompare(toLabel(b)));
+const coversSite = (source, target) => {
+  if (!source || !target) return false;
+  if (source.origin === target.origin) return true;
+  if (!source.wildcard) return false;
+  return coversHost(source, target.host);
+};
 
-const uniqueSorted = (sites) => sortSites([...new Set(sites)]);
+const cleanSites = (sites) => {
+  const parsed = [];
+  const seen = new Set();
+
+  for (const origin of sites) {
+    const site = parseOrigin(origin);
+    if (!site || seen.has(site.origin)) continue;
+    seen.add(site.origin);
+    parsed.push(site);
+  }
+
+  return parsed
+    .filter((site, index) => !parsed.some((other, otherIndex) => otherIndex !== index && other.wildcard && coversSite(other, site)))
+    .map((site) => site.origin)
+    .sort();
+};
+
+const getStoredSites = async () => {
+  const { sites } = await chrome.storage.local.get({ sites: [] });
+  return Array.isArray(sites) ? sites : [];
+};
+
+const setSites = (sites) => chrome.storage.local.set({ sites });
+
+const removePermissions = async (origins) => {
+  await Promise.all(origins.map((origin) => chrome.permissions.remove({ origins: [origin] }).catch(() => false)));
+};
 
 const getSites = async () => {
-  const { sites } = await chrome.storage.local.get({ sites: [] });
-  return uniqueSorted(sites.filter((site) => toHostname(site)));
-};
+  const sites = await getStoredSites();
+  const clean = cleanSites(sites);
+  const cleanSet = new Set(clean);
+  const removed = sites.filter((origin) => !cleanSet.has(origin));
 
-const setSites = (sites) => chrome.storage.local.set({ sites: uniqueSorted(sites) });
+  if (removed.length) await removePermissions(removed);
+  if (clean.length !== sites.length || clean.some((origin, index) => origin !== sites[index])) {
+    await setSites(clean);
+  }
+
+  return clean;
+};
 
 const syncRegistration = async (matches) => {
   const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [SCRIPT_ID] });
@@ -68,31 +107,22 @@ const reloadActive = () => {
   if (activeTab && activeTab.id != null) chrome.tabs.reload(activeTab.id);
 };
 
-const cleanCurrentDuplicates = async (sites) => {
-  if (!currentHostname) return sites;
-  const matches = sites.filter((origin) => matchesHostname(origin, currentHostname));
-  if (matches.length < 2) return sites;
-  const wildcard = matches.find((origin) => toHostname(origin).startsWith("*."));
-  const exact = matches.find((origin) => origin === currentOrigin);
-  const keep = wildcard || exact || matches[0];
-  const removed = matches.filter((origin) => origin !== keep);
-  const next = uniqueSorted([...sites.filter((origin) => !matches.includes(origin)), keep]);
-  await setSites(next);
-  await syncRegistration(next);
-  await Promise.all(removed.map((origin) => chrome.permissions.remove({ origins: [origin] }).catch(() => false)));
-  return next;
+const isCurrentEnabled = (sites) => {
+  if (!currentHost) return false;
+  return sites.some((origin) => coversHost(parseOrigin(origin), currentHost));
 };
 
 const enableCurrent = async () => {
-  if (!currentOrigin || !currentHostname) return;
+  if (!currentOrigin || !currentHost) return;
   const sites = await getSites();
-  if (sites.some((origin) => matchesHostname(origin, currentHostname))) {
+  if (isCurrentEnabled(sites)) {
+    await syncRegistration(sites);
     await render();
     return;
   }
   const granted = await chrome.permissions.request({ origins: [currentOrigin] });
   if (!granted) return;
-  const next = uniqueSorted([...sites, currentOrigin]);
+  const next = cleanSites([...sites, currentOrigin]);
   await setSites(next);
   await syncRegistration(next);
   reloadActive();
@@ -100,57 +130,58 @@ const enableCurrent = async () => {
 };
 
 const removeSite = async (origin) => {
-  const sites = (await getSites()).filter((site) => site !== origin);
-  await setSites(sites);
-  await syncRegistration(sites);
-  await chrome.permissions.remove({ origins: [origin] });
-  if (currentHostname && matchesHostname(origin, currentHostname)) reloadActive();
+  const sites = await getSites();
+  const next = cleanSites(sites.filter((site) => site !== origin));
+  await setSites(next);
+  await syncRegistration(next);
+  await chrome.permissions.remove({ origins: [origin] }).catch(() => false);
+  if (currentHost && coversHost(parseOrigin(origin), currentHost)) reloadActive();
   await render();
 };
 
 const removeCurrent = async () => {
-  if (!currentHostname) return;
+  if (!currentHost) return;
   const sites = await getSites();
-  const matches = sites.filter((origin) => matchesHostname(origin, currentHostname));
-  const next = sites.filter((origin) => !matches.includes(origin));
+  const removed = sites.filter((origin) => coversHost(parseOrigin(origin), currentHost));
+  const next = cleanSites(sites.filter((origin) => !coversHost(parseOrigin(origin), currentHost)));
   await setSites(next);
   await syncRegistration(next);
-  await Promise.all(matches.map((origin) => chrome.permissions.remove({ origins: [origin] }).catch(() => false)));
+  await removePermissions(removed);
   reloadActive();
   await render();
 };
 
 const render = async () => {
-  const sites = await cleanCurrentDuplicates(await getSites());
+  const sites = await getSites();
 
   listEl.textContent = "";
   for (const origin of sites) {
     const row = document.createElement("tr");
-    const name = document.createElement("td");
-    const action = document.createElement("td");
+    const nameCell = document.createElement("td");
+    const actionCell = document.createElement("td");
     const remove = document.createElement("button");
 
-    name.textContent = toLabel(origin);
+    nameCell.textContent = toLabel(origin);
     remove.textContent = "Remove";
     remove.setAttribute("aria-label", `Remove ${toLabel(origin)}`);
     remove.addEventListener("click", () => removeSite(origin));
 
-    action.append(remove);
-    row.append(name, action);
+    actionCell.append(remove);
+    row.append(nameCell, actionCell);
     listEl.append(row);
   }
+
   emptyEl.hidden = sites.length > 0;
 
-  if (currentOrigin && currentHostname) {
-    const on = sites.some((origin) => matchesHostname(origin, currentHostname));
-    hostEl.textContent = currentHostname;
+  if (currentHost) {
+    hostEl.textContent = currentHost;
     toggleEl.hidden = false;
-    toggleEl.textContent = on ? "Remove from this site" : "Enable on this site";
-    toggleEl.onclick = on ? removeCurrent : enableCurrent;
+    const enabled = isCurrentEnabled(sites);
+    toggleEl.textContent = enabled ? "Remove from this site" : "Enable on this site";
+    toggleEl.onclick = enabled ? removeCurrent : enableCurrent;
   } else {
     hostEl.textContent = "Unsupported page";
     toggleEl.hidden = true;
-    toggleEl.onclick = null;
   }
 };
 
@@ -160,12 +191,12 @@ const init = async () => {
   try {
     const url = new URL(tab.url);
     if (url.protocol === "http:" || url.protocol === "https:") {
-      currentHostname = url.hostname;
-      currentOrigin = toOrigin(currentHostname);
+      currentHost = url.hostname.toLowerCase();
+      currentOrigin = toOrigin(currentHost);
     }
   } catch (e) {
+    currentHost = null;
     currentOrigin = null;
-    currentHostname = null;
   }
   await render();
 };
