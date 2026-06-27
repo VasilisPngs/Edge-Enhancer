@@ -2,10 +2,6 @@
   color-scheme: light dark;
 }
 
-[hidden] {
-  display: none !important;
-}
-
 body {
   min-width: 340px;
 }
