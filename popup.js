@@ -1,4 +1,4 @@
-import { readSites, writeSites, normalizeSites, removePermissions, syncRegistration, hostFromMatch, matchFromHost } from "./shared.js";
+import { writeSites, normalizeSites, removePermissions, syncRegistration, hostFromMatch, matchFromHost, reconcileSites } from "./shared.js";
 
 const hostEl = document.getElementById("host");
 const toggleEl = document.getElementById("toggle");
@@ -9,19 +9,6 @@ let activeTab = null;
 let currentHost = null;
 let currentMatch = null;
 
-const changed = (before, after) =>
-  before.length !== after.length || after.some((match, index) => match !== before[index]);
-
-const reconcile = async () => {
-  const stored = await readSites();
-  const next = normalizeSites(stored);
-  const keep = new Set(next);
-  const dropped = stored.filter((match) => !keep.has(match));
-  if (dropped.length) await removePermissions(dropped);
-  if (dropped.length || changed(stored, next)) await writeSites(next);
-  return next;
-};
-
 const reloadActive = () => {
   if (activeTab && activeTab.id != null) chrome.tabs.reload(activeTab.id);
 };
@@ -30,10 +17,10 @@ const isEnabled = (sites) => currentHost != null && sites.some((match) => hostFr
 
 const enableCurrent = async () => {
   if (!currentMatch || !currentHost) return;
-  const sites = await reconcile();
+  const sites = await reconcileSites();
   if (isEnabled(sites)) {
     await syncRegistration(sites);
-    await render();
+    await render(sites);
     return;
   }
   const granted = await chrome.permissions.request({ origins: [currentMatch] });
@@ -42,36 +29,36 @@ const enableCurrent = async () => {
   await writeSites(next);
   await syncRegistration(next);
   reloadActive();
-  await render();
+  await render(next);
 };
 
 const removeSite = async (match) => {
-  const sites = await reconcile();
+  const sites = await reconcileSites();
   const next = normalizeSites(sites.filter((entry) => entry !== match));
   await writeSites(next);
   await syncRegistration(next);
   await chrome.permissions.remove({ origins: [match] }).catch(() => false);
   if (currentHost && hostFromMatch(match) === currentHost) reloadActive();
-  await render();
+  await render(next);
 };
 
 const removeCurrent = async () => {
   if (!currentHost) return;
-  const sites = await reconcile();
+  const sites = await reconcileSites();
   const target = sites.filter((match) => hostFromMatch(match) === currentHost);
   const next = normalizeSites(sites.filter((match) => hostFromMatch(match) !== currentHost));
   await writeSites(next);
   await syncRegistration(next);
   await removePermissions(target);
   reloadActive();
-  await render();
+  await render(next);
 };
 
-const render = async () => {
-  const sites = await reconcile();
+const render = async (sites) => {
+  const list = sites ?? await reconcileSites();
 
   listEl.textContent = "";
-  for (const match of sites) {
+  for (const match of list) {
     const host = hostFromMatch(match);
     const row = document.createElement("tr");
     const nameCell = document.createElement("td");
@@ -88,12 +75,12 @@ const render = async () => {
     listEl.append(row);
   }
 
-  emptyEl.hidden = sites.length > 0;
+  emptyEl.hidden = list.length > 0;
 
   if (currentHost) {
     hostEl.textContent = currentHost;
     toggleEl.hidden = false;
-    const enabled = isEnabled(sites);
+    const enabled = isEnabled(list);
     toggleEl.textContent = enabled ? "Remove from this site" : "Enable on this site";
     toggleEl.onclick = enabled ? removeCurrent : enableCurrent;
   } else {
@@ -111,7 +98,7 @@ const init = async () => {
       currentHost = url.hostname.toLowerCase();
       currentMatch = matchFromHost(currentHost);
     }
-  } catch (e) {
+  } catch {
     currentHost = null;
     currentMatch = null;
   }
